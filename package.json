@@ -1,12 +1,9 @@
 {
-  "name": "testcapp",
+  "name": "local-event-crawler",
   "version": "1.0.0",
-  "description": "Message board app that saves messages to a local file",
+  "description": "Web crawler app that finds online events near a location",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
-  },
-  "dependencies": {
-    "express": "^4.21.0"
   }
 }

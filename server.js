@@ -1,123 +1,209 @@
-const express = require("express");
+const http = require("http");
 const fs = require("fs");
 const path = require("path");
 
-const app = express();
 const PORT = process.env.PORT || 3000;
-const MAX_MESSAGE_LENGTH = 280;
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const MESSAGES_FILE = path.join(__dirname, "data", "messages.json");
+const SEARCH_RESULT_LIMIT = 6;
+const PUBLIC_DIR = path.join(__dirname, "public");
 
-app.use(express.json());
-app.use(express.static(path.join(__dirname, "public")));
-
-// Ensure data directory exists
-fs.mkdirSync(path.dirname(MESSAGES_FILE), { recursive: true });
-
-// Initialize messages file if it doesn't exist
-if (!fs.existsSync(MESSAGES_FILE)) {
-  fs.writeFileSync(MESSAGES_FILE, JSON.stringify([], null, 2));
+function withTimeout(ms) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), ms);
+  return { signal: controller.signal, clear: () => clearTimeout(timeout) };
 }
 
-function readMessages() {
-  const data = fs.readFileSync(MESSAGES_FILE, "utf-8");
-  return JSON.parse(data);
+async function fetchText(url) {
+  const timer = withTimeout(8000);
+  try {
+    const res = await fetch(url, {
+      signal: timer.signal,
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; EventCrawler/1.0)" },
+    });
+    if (!res.ok) return "";
+    return await res.text();
+  } catch {
+    return "";
+  } finally {
+    timer.clear();
+  }
 }
 
-function writeMessages(messages) {
-  fs.writeFileSync(MESSAGES_FILE, JSON.stringify(messages, null, 2));
+function decodeHtmlEntities(text) {
+  return text
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
 }
 
-async function sendTelegramNotification(text) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-    console.warn("Telegram notification skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set");
+async function findCandidatePages(query) {
+  const url = `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+  const html = await fetchText(url);
+  if (!html) return [];
+
+  const links = [];
+  const regex = /<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)<\/a>/gims;
+  let match;
+
+  while ((match = regex.exec(html)) !== null && links.length < SEARCH_RESULT_LIMIT) {
+    const href = decodeHtmlEntities(match[1]);
+    const title = decodeHtmlEntities(match[2].replace(/<[^>]+>/g, "").trim());
+    if (href.startsWith("http")) links.push({ title, href });
+  }
+
+  return links;
+}
+
+function normalizeMaybeArray(value) {
+  if (Array.isArray(value)) return value;
+  if (!value) return [];
+  return [value];
+}
+
+function eventFromJsonLd(eventObj, pageUrl) {
+  const location = eventObj.location || {};
+  const address = location.address || {};
+  const addressText = typeof address === "string"
+    ? address
+    : [address.streetAddress, address.addressLocality, address.addressRegion, address.postalCode].filter(Boolean).join(", ");
+
+  return {
+    title: eventObj.name || "Untitled event",
+    startDate: eventObj.startDate || "Unknown date",
+    endDate: eventObj.endDate || null,
+    venue: location.name || "Unknown venue",
+    address: addressText || "Address unavailable",
+    url: eventObj.url || pageUrl,
+    source: new URL(pageUrl).hostname,
+  };
+}
+
+function parseEventScripts(html, pageUrl) {
+  const events = [];
+  const scriptRegex = /<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gim;
+  let scriptMatch;
+
+  while ((scriptMatch = scriptRegex.exec(html)) !== null) {
+    const jsonText = scriptMatch[1].trim();
+    if (!jsonText) continue;
+
+    try {
+      const parsed = JSON.parse(jsonText);
+      const nodes = normalizeMaybeArray(parsed["@graph"] || parsed);
+      nodes.forEach((node) => {
+        if (!node || typeof node !== "object") return;
+        const nodeType = normalizeMaybeArray(node["@type"]);
+        const isEvent = nodeType.some((type) => String(type).toLowerCase() === "event");
+        if (isEvent) events.push(eventFromJsonLd(node, pageUrl));
+      });
+    } catch {}
+  }
+
+  return events;
+}
+
+function dedupeEvents(events) {
+  const seen = new Set();
+  return events.filter((event) => {
+    const key = `${event.title}|${event.startDate}|${event.url}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function eventMatchesLocation(event, location) {
+  return `${event.venue} ${event.address}`.toLowerCase().includes(location.toLowerCase());
+}
+
+function sendJson(res, statusCode, payload) {
+  const body = JSON.stringify(payload);
+  res.writeHead(statusCode, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Content-Length": Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+function serveStatic(req, res) {
+  const rawPath = req.url === "/" ? "/index.html" : req.url;
+  const sanitizedPath = path.normalize(rawPath).replace(/^([.][.][/\\])+/, "");
+  const filePath = path.join(PUBLIC_DIR, sanitizedPath);
+
+  if (!filePath.startsWith(PUBLIC_DIR)) {
+    res.writeHead(403);
+    res.end("Forbidden");
     return;
   }
-  try {
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text }),
-    });
-    if (!res.ok) {
-      const err = await res.text();
-      console.error("Telegram API error:", err);
+
+  fs.readFile(filePath, (err, data) => {
+    if (err) {
+      res.writeHead(404);
+      res.end("Not found");
+      return;
     }
-  } catch (err) {
-    console.error("Failed to send Telegram notification:", err.message);
-  }
+    const ext = path.extname(filePath);
+    const type = ext === ".html" ? "text/html" : "text/plain";
+    res.writeHead(200, { "Content-Type": `${type}; charset=utf-8` });
+    res.end(data);
+  });
 }
 
-// Get all messages
-app.get("/api/messages", (req, res) => {
-  const messages = readMessages();
-  res.json(messages);
+async function handleSearch(req, res) {
+  let body = "";
+  req.on("data", (chunk) => { body += chunk; });
+  req.on("end", async () => {
+    let payload;
+    try {
+      payload = JSON.parse(body || "{}");
+    } catch {
+      sendJson(res, 400, { error: "Invalid JSON." });
+      return;
+    }
+
+    const { location, keyword = "events" } = payload;
+    if (!location || typeof location !== "string" || !location.trim()) {
+      sendJson(res, 400, { error: "A location is required." });
+      return;
+    }
+
+    const normalizedLocation = location.trim();
+    const normalizedKeyword = typeof keyword === "string" && keyword.trim() ? keyword.trim() : "events";
+    const pages = await findCandidatePages(`${normalizedKeyword} near ${normalizedLocation}`);
+
+    const crawled = await Promise.all(pages.map(async (page) => {
+      const html = await fetchText(page.href);
+      if (!html) return [];
+      return parseEventScripts(html, page.href);
+    }));
+
+    const events = dedupeEvents(crawled.flat()).filter((event) => eventMatchesLocation(event, normalizedLocation));
+    sendJson(res, 200, {
+      location: normalizedLocation,
+      keyword: normalizedKeyword,
+      scannedPages: pages.length,
+      foundEvents: events.length,
+      events,
+    });
+  });
+}
+
+const server = http.createServer((req, res) => {
+  if (req.method === "POST" && req.url === "/api/events/search") {
+    handleSearch(req, res);
+    return;
+  }
+
+  if (req.method === "GET") {
+    serveStatic(req, res);
+    return;
+  }
+
+  res.writeHead(405);
+  res.end("Method Not Allowed");
 });
 
-// Add a new message
-app.post("/api/messages", (req, res) => {
-  const { message } = req.body;
-
-  if (!message || typeof message !== "string") {
-    return res.status(400).json({ error: "Message is required" });
-  }
-
-  const trimmed = message.trim();
-
-  if (trimmed.length === 0) {
-    return res.status(400).json({ error: "Message cannot be empty" });
-  }
-
-  if (trimmed.length > MAX_MESSAGE_LENGTH) {
-    return res
-      .status(400)
-      .json({ error: `Message must be ${MAX_MESSAGE_LENGTH} characters or less` });
-  }
-
-  const messages = readMessages();
-  const entry = {
-    id: Date.now(),
-    message: trimmed,
-    timestamp: new Date().toISOString(),
-  };
-  messages.push(entry);
-  writeMessages(messages);
-
-  sendTelegramNotification(`New message on Message Board:\n\n${trimmed}`);
-
-  res.status(201).json(entry);
-});
-
-// Telegram webhook - receives messages sent to the bot
-app.post("/api/telegram-webhook", (req, res) => {
-  const update = req.body;
-  const text = update?.message?.text;
-
-  if (!text) {
-    return res.sendStatus(200);
-  }
-
-  const from = update.message.from;
-  const sender = from.username
-    ? `@${from.username}`
-    : [from.first_name, from.last_name].filter(Boolean).join(" ");
-
-  const messages = readMessages();
-  const entry = {
-    id: Date.now(),
-    message: text,
-    timestamp: new Date().toISOString(),
-    source: "telegram",
-    sender,
-  };
-  messages.push(entry);
-  writeMessages(messages);
-
-  res.sendStatus(200);
-});
-
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+server.listen(PORT, () => {
+  console.log(`Event crawler app running on port ${PORT}`);
 });

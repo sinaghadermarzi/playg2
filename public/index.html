@@ -3,196 +3,138 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Message Board</title>
+    <title>Local Event Crawler</title>
     <style>
-      * {
-        box-sizing: border-box;
-        margin: 0;
-        padding: 0;
-      }
+      * { box-sizing: border-box; }
       body {
         font-family: system-ui, sans-serif;
-        max-width: 600px;
-        margin: 40px auto;
-        padding: 0 20px;
-        color: #333;
+        max-width: 860px;
+        margin: 30px auto;
+        padding: 0 18px;
+        color: #1f2937;
       }
-      h1 {
-        margin-bottom: 24px;
-      }
+      h1 { margin-bottom: 10px; }
+      p.help { color: #4b5563; margin-bottom: 22px; }
       form {
-        display: flex;
-        flex-direction: column;
-        gap: 8px;
-        margin-bottom: 32px;
+        display: grid;
+        grid-template-columns: 2fr 2fr auto;
+        gap: 10px;
+        margin-bottom: 18px;
       }
-      textarea {
-        width: 100%;
-        height: 80px;
-        padding: 10px;
-        border: 1px solid #ccc;
-        border-radius: 6px;
-        font-family: inherit;
+      input, button {
+        padding: 10px 12px;
+        border-radius: 8px;
+        border: 1px solid #d1d5db;
         font-size: 14px;
-        resize: vertical;
-      }
-      .form-footer {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-      }
-      .char-count {
-        font-size: 13px;
-        color: #888;
-      }
-      .char-count.over {
-        color: #e00;
-        font-weight: bold;
       }
       button {
-        padding: 8px 20px;
-        background: #333;
-        color: #fff;
+        background: #2563eb;
+        color: white;
         border: none;
-        border-radius: 6px;
-        font-size: 14px;
         cursor: pointer;
       }
-      button:disabled {
-        opacity: 0.5;
-        cursor: not-allowed;
-      }
-      .error {
-        color: #e00;
-        font-size: 13px;
-        margin-top: 4px;
-      }
-      #messages {
+      button:disabled { opacity: .6; cursor: not-allowed; }
+      .meta { color: #6b7280; font-size: 13px; margin: 6px 0 16px; }
+      .error { color: #b91c1c; margin-bottom: 14px; }
+      #events {
         list-style: none;
-        display: flex;
-        flex-direction: column;
-        gap: 12px;
+        padding: 0;
+        display: grid;
+        gap: 10px;
       }
-      #messages li {
+      #events li {
+        border: 1px solid #e5e7eb;
+        border-radius: 8px;
         padding: 12px;
-        border: 1px solid #e0e0e0;
-        border-radius: 6px;
-        background: #fafafa;
+        background: #f8fafc;
       }
-      #messages li .text {
-        white-space: pre-wrap;
-        word-break: break-word;
-      }
-      #messages li .meta {
-        margin-top: 6px;
-        font-size: 12px;
-        color: #999;
-      }
-      #messages li .source {
-        display: inline-block;
-        font-size: 11px;
-        padding: 1px 6px;
-        border-radius: 4px;
-        background: #0088cc;
-        color: #fff;
-        margin-bottom: 4px;
+      .title { font-weight: 700; margin-bottom: 4px; }
+      .sub { color: #374151; font-size: 14px; margin-bottom: 3px; }
+      .source { font-size: 12px; color: #6b7280; }
+      @media (max-width: 720px) {
+        form { grid-template-columns: 1fr; }
       }
     </style>
   </head>
   <body>
-    <h1>Message Board</h1>
+    <h1>Find Events Near You</h1>
+    <p class="help">This app crawls public web pages and extracts structured event listings (JSON-LD) for a location.</p>
 
-    <form id="msg-form">
-      <textarea
-        id="msg-input"
-        maxlength="280"
-        placeholder="Write a message (max 280 characters)..."
-      ></textarea>
-      <div class="form-footer">
-        <span class="char-count" id="char-count">0 / 280</span>
-        <button type="submit" id="submit-btn">Post</button>
-      </div>
-      <div class="error" id="error"></div>
+    <form id="search-form">
+      <input id="location" placeholder="Location (e.g., Austin, TX)" required />
+      <input id="keyword" placeholder="Keyword (e.g., music, startup, food)" value="events" />
+      <button type="submit" id="search-btn">Search</button>
     </form>
 
-    <ul id="messages"></ul>
+    <div class="meta" id="meta"></div>
+    <div class="error" id="error"></div>
+    <ul id="events"></ul>
 
     <script>
-      const MAX = 280;
-      const form = document.getElementById("msg-form");
-      const input = document.getElementById("msg-input");
-      const charCount = document.getElementById("char-count");
+      const form = document.getElementById("search-form");
+      const locationInput = document.getElementById("location");
+      const keywordInput = document.getElementById("keyword");
+      const eventsList = document.getElementById("events");
+      const meta = document.getElementById("meta");
       const errorEl = document.getElementById("error");
-      const messagesList = document.getElementById("messages");
-      const submitBtn = document.getElementById("submit-btn");
+      const searchBtn = document.getElementById("search-btn");
 
-      input.addEventListener("input", () => {
-        const len = input.value.length;
-        charCount.textContent = `${len} / ${MAX}`;
-        charCount.classList.toggle("over", len > MAX);
-      });
+      function renderEvents(events) {
+        eventsList.innerHTML = "";
 
-      async function loadMessages() {
-        const res = await fetch("/api/messages");
-        const messages = await res.json();
-        messagesList.innerHTML = "";
-        messages
-          .slice()
-          .reverse()
-          .forEach((m) => {
-            const li = document.createElement("li");
-            if (m.source === "telegram") {
-              const source = document.createElement("span");
-              source.className = "source";
-              source.textContent = `Telegram — ${m.sender}`;
-              li.appendChild(source);
-            }
-            const text = document.createElement("div");
-            text.className = "text";
-            text.textContent = m.message;
-            const meta = document.createElement("div");
-            meta.className = "meta";
-            meta.textContent = new Date(m.timestamp).toLocaleString();
-            li.appendChild(text);
-            li.appendChild(meta);
-            messagesList.appendChild(li);
-          });
+        if (!events.length) {
+          const li = document.createElement("li");
+          li.textContent = "No events found. Try a nearby city or broader keyword.";
+          eventsList.appendChild(li);
+          return;
+        }
+
+        events.forEach((event) => {
+          const li = document.createElement("li");
+          li.innerHTML = `
+            <div class="title">${event.title}</div>
+            <div class="sub">📍 ${event.venue} — ${event.address}</div>
+            <div class="sub">🗓 ${new Date(event.startDate).toLocaleString()}</div>
+            <div class="source">Source: ${event.source} · <a href="${event.url}" target="_blank" rel="noopener noreferrer">Open event page</a></div>
+          `;
+          eventsList.appendChild(li);
+        });
       }
 
       form.addEventListener("submit", async (e) => {
         e.preventDefault();
         errorEl.textContent = "";
-        const message = input.value.trim();
+        meta.textContent = "Searching...";
+        eventsList.innerHTML = "";
+        searchBtn.disabled = true;
 
-        if (!message) {
-          errorEl.textContent = "Message cannot be empty.";
-          return;
-        }
-
-        submitBtn.disabled = true;
         try {
-          const res = await fetch("/api/messages", {
+          const response = await fetch("/api/events/search", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ message }),
+            body: JSON.stringify({
+              location: locationInput.value.trim(),
+              keyword: keywordInput.value.trim() || "events",
+            }),
           });
-          if (!res.ok) {
-            const data = await res.json();
-            errorEl.textContent = data.error || "Something went wrong.";
+
+          const data = await response.json();
+
+          if (!response.ok) {
+            errorEl.textContent = data.error || "Search failed.";
+            meta.textContent = "";
             return;
           }
-          input.value = "";
-          charCount.textContent = "0 / 280";
-          await loadMessages();
+
+          meta.textContent = `Scanned ${data.scannedPages} pages · Found ${data.foundEvents} events near ${data.location}.`;
+          renderEvents(data.events);
         } catch {
-          errorEl.textContent = "Failed to send message.";
+          meta.textContent = "";
+          errorEl.textContent = "Could not complete search. Please try again.";
         } finally {
-          submitBtn.disabled = false;
+          searchBtn.disabled = false;
         }
       });
-
-      loadMessages();
-      setInterval(loadMessages, 5000);
     </script>
   </body>
 </html>
